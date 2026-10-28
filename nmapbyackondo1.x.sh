@@ -158,6 +158,7 @@ if (!$yes) {
     }
     $answer = '' unless defined $answer;
     chomp $answer;
+    $answer =~ s/\A\s+|\s+\z//g;
     if ($answer !~ /\Ay(es)?\z/i) {
         if (!-t STDIN) {
             print STDERR "No TTY: pass -y/--yes (or pipe 'y') to confirm.\n";
@@ -173,6 +174,7 @@ if (length $output && -e $output && !$yes) {
     my $a = <STDIN>;
     $a = '' unless defined $a;
     chomp $a;
+    $a =~ s/\A\s+|\s+\z//g;
     die "Aborted; report not written.\n" unless $a =~ /\Ay(es)?\z/i;
 }
 
@@ -202,11 +204,16 @@ sub service {
 my $open = 0;
 my $closed = 0;
 my $filtered = 0;
+my $error = 0;
 my $started = time();
 my $done = 0;
 my $total = scalar @ports;
 my $interrupted = 0;
 my @results;
+
+# Live concurrency cap. Starts at -c and backs off if the kernel refuses
+# sockets, then creeps back up as the backlog drains.
+my $eff = $conc;
 
 sub record {
     my ($port, $label, $ref) = @_;
@@ -222,7 +229,6 @@ $SIG{INT} = sub { $interrupted = 1 };
 
 my @queue = @ports;
 my %pend;
-my %retry;
 my $sel = IO::Select->new;
 
 # Shortest pending deadline, but never longer than the timeout.
@@ -237,22 +243,22 @@ sub nap {
 }
 
 while ((@queue || $sel->count) && !$interrupted) {
-    # Fill up to the concurrency cap.
-    while (@queue && $sel->count < $conc) {
+    # Creep the cap back toward -c once there is room again.
+    $eff++ if $eff < $conc && $sel->count < $eff;
+
+    # Fill up to the live cap.
+    while (@queue && $sel->count < $eff) {
         my $port = shift @queue;
         my $s;
         unless (socket($s, $family, SOCK_STREAM, 0)) {
-            # Back off and retry a couple of times (fd exhaustion).
-            if (($retry{$port} //= 0) < 2) {
-                $retry{$port}++;
-                unshift @queue, $port;
-                sleep 0.05;
-            } else {
-                record($port, 'error', \$filtered);
-            }
+            # Kernel is out of descriptors: squeeze the cap to what is actually
+            # in flight, put the port back, and try again next pass.
+            $eff = $sel->count > 1 ? $sel->count : 1;
+            unshift @queue, $port;
+            sleep 0.05;
             last;
         }
-        my $flags = fcntl($s, F_GETFL, 0);
+        my $flags = fcntl($s, F_GETFL, 0) // 0;
         fcntl($s, F_SETFL, $flags | O_NONBLOCK);
         my $rc = connect($s, $saddr);
         if (!$rc && $!{EINPROGRESS}) {
@@ -324,8 +330,8 @@ for my $r (sort { $a->[0] <=> $b->[0] } @results) {
     push @lines, sprintf('%-11s %-10s %s', "$r->[0]/tcp", $r->[1], service($r->[0]));
 }
 push @lines, sprintf(
-    'Open: %d | Closed: %d | Filtered: %d | Scanned: %d/%d | Elapsed: %.2fs',
-    $open, $closed, $filtered, $done, $total, $elapsed,
+    'Open: %d | Closed: %d | Filtered: %d | Error: %d | Scanned: %d/%d | Elapsed: %.2fs',
+    $open, $closed, $filtered, $error, $done, $total, $elapsed,
 );
 
 print join("\n", @lines), "\n";
