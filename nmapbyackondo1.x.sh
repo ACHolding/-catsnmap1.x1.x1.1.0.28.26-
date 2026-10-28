@@ -32,7 +32,7 @@ use IO::Select;
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use Getopt::Long qw(GetOptions);
 use Time::HiRes qw(time sleep);
-use Errno qw(EINPROGRESS ECONNREFUSED);
+use Errno qw(EINPROGRESS ECONNREFUSED EHOSTUNREACH ENETUNREACH);
 use Socket qw(
     getaddrinfo getnameinfo NI_NUMERICHOST
     SOCK_STREAM SOL_SOCKET SO_ERROR
@@ -209,6 +209,7 @@ my $started = time();
 my $done = 0;
 my $total = scalar @ports;
 my $interrupted = 0;
+my $sockfail = 0;
 my @results;
 
 # Live concurrency cap. Starts at -c and backs off if the kernel refuses
@@ -252,12 +253,17 @@ while ((@queue || $sel->count) && !$interrupted) {
         my $s;
         unless (socket($s, $family, SOCK_STREAM, 0)) {
             # Kernel is out of descriptors: squeeze the cap to what is actually
-            # in flight, put the port back, and try again next pass.
+            # in flight, put the port back, and try again next pass. Give up
+            # rather than livelock if it never recovers.
+            if (++$sockfail > 200) {
+                die "Cannot open sockets (raise ulimit -n or lower -c)\n";
+            }
             $eff = $sel->count > 1 ? $sel->count : 1;
             unshift @queue, $port;
             sleep 0.05;
             last;
         }
+        $sockfail = 0;
         my $flags = fcntl($s, F_GETFL, 0) // 0;
         fcntl($s, F_SETFL, $flags | O_NONBLOCK);
         my $rc = connect($s, $saddr);
@@ -276,6 +282,8 @@ while ((@queue || $sel->count) && !$interrupted) {
             close $s;
             if ($e == ECONNREFUSED()) {
                 record($port, 'closed', \$closed);
+            } elsif ($e == EHOSTUNREACH() || $e == ENETUNREACH()) {
+                record($port, 'error', \$error);
             } else {
                 record($port, 'filtered', \$filtered);
             }
@@ -295,6 +303,8 @@ while ((@queue || $sel->count) && !$interrupted) {
             record($e->{port}, 'open', \$open);
         } elsif ($err == ECONNREFUSED()) {
             record($e->{port}, 'closed', \$closed);
+        } elsif ($err == EHOSTUNREACH() || $err == ENETUNREACH()) {
+            record($e->{port}, 'error', \$error);
         } else {
             record($e->{port}, 'filtered', \$filtered);
         }
